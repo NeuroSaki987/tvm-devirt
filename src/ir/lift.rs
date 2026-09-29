@@ -975,10 +975,9 @@ impl<'a> Emulator<'a> {
             });
             return v;
         }
-        // The address is not concrete, but it may still take only two values: the
-        // VM reads its dispatch tables with `mov eax, [C + (cond << k)]`. Resolve
-        // that here rather than leaving an opaque read behind.
-        if let Some(v) = self.load_via_predicate_split(addr, width, site) {
+        // A backwards slice of the symbolic address may expose a small table
+        // index. Resolve every possible arm against immutable image bytes.
+        if let Some(v) = self.load_via_bounded_index(addr, width, site) {
             return v;
         }
 
@@ -996,8 +995,7 @@ impl<'a> Emulator<'a> {
         v
     }
 
-    /// Resolve a load whose address is not concrete but takes exactly two values,
-    /// by splitting on a 0/1 subexpression of it.
+    /// Resolve a load whose symbolic address is controlled by a small index.
     ///
     /// The VM reads dispatch tables as `mov eax, [C + (cond << k)]`, where `cond`
     /// is a guest predicate the evaluator cannot decide. Pinning it both ways makes
@@ -1011,17 +1009,17 @@ impl<'a> Emulator<'a> {
     /// the subtraction collapses -- which is what lets the dispatch above it become
     /// a two-way branch that recovery can split.
     ///
-    /// Only a two-way split is attempted. An address with more freedom is left
-    /// symbolic: enumerating it needs a sound bound on the predicate, and recovery
-    /// already has `narrow_indices` for the cases where such a bound exists.
-    fn load_via_predicate_split(&mut self, addr: Ref, width: Width, site: u64) -> Option<Ref> {
-        let candidates = boolean_subexpressions(&mut self.arena, addr);
-        for cand in candidates {
+    /// The range comes only from proven-zero high bits. Every value in that range
+    /// must fold to a readable address; otherwise the load stays symbolic.
+    fn load_via_bounded_index(&mut self, addr: Ref, width: Width, site: u64) -> Option<Ref> {
+        let candidates = bounded_subexpressions(&mut self.arena, addr);
+        for (cand, span) in candidates {
             if self.pins.iter().any(|(p, _)| *p == cand) {
                 continue;
             }
-            let mut alts = [None, None];
-            for (i, value) in [0u64, 1u64].into_iter().enumerate() {
+            let mut addresses = Vec::with_capacity(span as usize + 1);
+            let mut complete = true;
+            for value in 0..=span {
                 let saved_pins = self.pins.len();
                 let saved_watermark = self.memo_pin_count;
                 self.pins.push((cand, value));
@@ -1029,23 +1027,37 @@ impl<'a> Emulator<'a> {
                 self.pin_dep.clear();
                 self.memo_pin_count = self.pins.len();
                 let folded = self.substitute(addr);
-                alts[i] = self.arena.as_const(folded);
+                let concrete = self.arena.as_const(folded);
                 self.pins.truncate(saved_pins);
                 self.subst_memo.clear();
                 self.pin_dep.clear();
                 self.memo_pin_count = saved_watermark;
+                let Some(concrete) = concrete else {
+                    complete = false;
+                    break;
+                };
+                addresses.push(concrete);
             }
-            let (Some(a0), Some(a1)) = (alts[0], alts[1]) else {
-                continue;
-            };
-            if a0 == a1 {
-                // Not a discriminator for this address after all.
+            if !complete || addresses.iter().all(|a| *a == addresses[0]) {
                 continue;
             }
-            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width)) else {
+            let mut values = Vec::with_capacity(addresses.len());
+            for concrete in addresses {
+                let Some(value) = self.image_load(concrete, width) else {
+                    complete = false;
+                    break;
+                };
+                values.push(value);
+            }
+            if !complete {
                 continue;
-            };
-            let v = self.arena.select(cand, v1, v0);
+            }
+            let mut v = values[0];
+            for (index, arm) in values.into_iter().enumerate().skip(1) {
+                let k = self.arena.constant(index as u64, self.arena.width(cand));
+                let matches = self.arena.bin(BinOp::Eq, cand, k);
+                v = self.arena.select(matches, arm, v);
+            }
             let region = self.region_of_symbolic(addr);
             self.events.push(Event::Load {
                 addr,
@@ -2659,45 +2671,59 @@ impl<'a> Emulator<'a> {
     }
 }
 
-/// Whether the instruction has an FS/GS-relative memory operand. Only these two matter.
-/// Subexpressions of `r` that provably hold only 0 or 1, deepest first.
-///
-/// The VM's table indices are built by `cond ? A : B` compiled into arithmetic, so
-/// the predicate shows up below a `trunc32`/`zext64`/`shl` chain rather than as a
-/// bare value. Deepest first tries the innermost predicate before the composites
-/// built on top of it, which is the one that actually discriminates the address.
-fn boolean_subexpressions(a: &mut Arena, r: Ref) -> Vec<Ref> {
-    let mut out: Vec<(u32, Ref)> = Vec::new();
+/// Largest bounded table index accepted by symbolic image-load recovery.
+/// Sixteen arms keep reconstruction and pinning work small.
+const MAX_TABLE_LOAD_SPAN: u64 = 15;
+
+/// Subexpressions of `r` whose high bits are provably zero, narrowest and then
+/// deepest first. Walking from the final address limits this to its backwards slice.
+fn bounded_subexpressions(a: &mut Arena, r: Ref) -> Vec<(Ref, u64)> {
+    let mut out: Vec<(u64, std::cmp::Reverse<u32>, Ref)> = Vec::new();
     let mut stack = vec![(r, 0u32)];
     let mut seen = std::collections::HashSet::new();
-    while let Some((cur, d)) = stack.pop() {
+    while let Some((cur, depth)) = stack.pop() {
         if !seen.insert(cur) {
             continue;
         }
-        // Every bit except bit 0 is provably zero, so the value is 0 or 1.
-        if !a.is_const(cur) && a.known_zero(cur) | 1 == u64::MAX {
-            out.push((d, cur));
+        if !a.is_const(cur) {
+            let live = !a.known_zero(cur) & a.width(cur).mask();
+            if live != 0 && live.count_ones() == live.trailing_ones() && live <= MAX_TABLE_LOAD_SPAN
+            {
+                out.push((live, std::cmp::Reverse(depth), cur));
+            }
         }
         match *a.op(cur) {
             Op::Bin(_, x, y) => {
-                stack.push((x, d + 1));
-                stack.push((y, d + 1));
+                stack.push((x, depth + 1));
+                stack.push((y, depth + 1));
             }
             Op::Un(_, x) | Op::Zext(x) | Op::Sext(x) | Op::Trunc(x) | Op::Load(x, _) => {
-                stack.push((x, d + 1))
+                stack.push((x, depth + 1))
             }
             Op::Select(c, x, y) => {
-                stack.push((c, d + 1));
-                stack.push((x, d + 1));
-                stack.push((y, d + 1));
+                stack.push((c, depth + 1));
+                stack.push((x, depth + 1));
+                stack.push((y, depth + 1));
             }
             _ => {}
         }
     }
-    out.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
-    out.into_iter().map(|(_, r)| r).collect()
+    out.sort_by_key(|(span, depth, _)| (*span, *depth));
+    out.into_iter()
+        .map(|(span, _, node)| (node, span))
+        .collect()
 }
 
+/// Boolean candidates retained for focused tests of two-way table addresses.
+#[cfg(test)]
+fn boolean_subexpressions(a: &mut Arena, r: Ref) -> Vec<Ref> {
+    bounded_subexpressions(a, r)
+        .into_iter()
+        .filter_map(|(node, span)| (span == 1).then_some(node))
+        .collect()
+}
+
+/// Whether the instruction has an FS/GS-relative memory operand. Only these two matter.
 fn seg_relative(inst: &Instruction) -> bool {
     matches!(inst.segment_prefix(), Register::FS | Register::GS)
         && (0..inst.op_count()).any(|i| inst.op_kind(i) == OpKind::Memory)
@@ -3379,7 +3405,108 @@ mod tail_call_tests {
 #[cfg(test)]
 mod predicate_split_tests {
     use super::*;
+    use crate::binary::pe::{PeFile, Section};
     use crate::ir::expr::{Arena, BinOp, Width};
+
+    const TABLE_BASE: u64 = 0x0001_4000_2000;
+
+    fn table_pe(words: &[u32], virtual_size: u32) -> PeFile {
+        let mut data = vec![0u8; 0x400];
+        for (i, word) in words.iter().enumerate() {
+            let off = 0x200 + i * 4;
+            data[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        PeFile {
+            data,
+            image_base: 0x0001_4000_0000,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x3000,
+            sections: vec![Section {
+                name: ".rdata".into(),
+                virtual_address: 0x2000,
+                virtual_size,
+                raw_address: 0x200,
+                raw_size: virtual_size,
+                characteristics: 0x4000_0000,
+            }],
+            opt_header_offset: 0,
+            section_table_offset: 0,
+            file_alignment: 0x200,
+            section_alignment: 0x1000,
+            size_of_headers: 0x200,
+            loader_bound: Vec::new(),
+        }
+    }
+
+    fn four_way_address(emu: &mut Emulator<'_>) -> (Ref, Ref) {
+        let raw = emu.arena.init_reg(Reg::Rdx);
+        let mask = emu.arena.constant(3, Width::W64);
+        let index = emu.arena.bin(BinOp::And, raw, mask);
+        let shift = emu.arena.constant(2, Width::W64);
+        let offset = emu.arena.bin(BinOp::Shl, index, shift);
+        let base = emu.arena.constant(TABLE_BASE, Width::W64);
+        (index, emu.arena.bin(BinOp::Add, base, offset))
+    }
+
+    #[test]
+    fn the_existing_two_way_table_load_still_recovers() {
+        let words = [0x1111_1111, 0x2222_2222];
+        let pe = table_pe(&words, 8);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let x = emu.arena.init_reg(Reg::Rdx);
+        let y = emu.arena.init_reg(Reg::R8);
+        let cond = emu.arena.bin(BinOp::Ult, x, y);
+        let wide = emu.arena.zext(cond, Width::W64);
+        let shift = emu.arena.constant(2, Width::W64);
+        let offset = emu.arena.bin(BinOp::Shl, wide, shift);
+        let base = emu.arena.constant(TABLE_BASE, Width::W64);
+        let addr = emu.arena.bin(BinOp::Add, base, offset);
+
+        let value = emu.load(addr, Width::W32, TABLE_BASE);
+
+        assert!(!matches!(emu.arena.op(value), Op::Load(..)));
+        for (pin, expected) in words.into_iter().enumerate() {
+            let mut probe = emu.clone();
+            probe.pins.push((cond, pin as u64));
+            let folded = probe.substitute(value);
+            assert_eq!(probe.arena.as_const(folded), Some(expected as u64));
+        }
+    }
+
+    #[test]
+    fn a_four_way_read_only_table_load_is_recovered() {
+        let words = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        let pe = table_pe(&words, 0x10);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let (index, addr) = four_way_address(&mut emu);
+
+        let value = emu.load(addr, Width::W32, TABLE_BASE);
+
+        assert!(
+            !matches!(emu.arena.op(value), Op::Load(..)),
+            "a bounded table address should be rebuilt from concrete arms"
+        );
+        assert!(emu.symbolic_loads.is_empty());
+        for (i, expected) in words.into_iter().enumerate() {
+            let mut probe = emu.clone();
+            probe.pins.push((index, i as u64));
+            let folded = probe.substitute(value);
+            assert_eq!(probe.arena.as_const(folded), Some(expected as u64));
+        }
+    }
+
+    #[test]
+    fn a_bounded_table_load_is_rejected_if_any_arm_is_unreadable() {
+        let words = [0x1111_1111, 0x2222_2222, 0x3333_3333];
+        let pe = table_pe(&words, 0x0c);
+        let mut emu = Emulator::new(&pe, 0x7fff_ffff_0000);
+        let (_, addr) = four_way_address(&mut emu);
+
+        let value = emu.load(addr, Width::W32, TABLE_BASE);
+
+        assert!(matches!(emu.arena.op(value), Op::Load(..)));
+        assert_eq!(emu.symbolic_loads, vec![(TABLE_BASE, Width::W32)]);
+    }
 
     /// The VM's table index is `cond ? A : B` compiled into `C + (cond << k)`. The
     /// split needs the predicate, so it has to be offered as a candidate, while the
