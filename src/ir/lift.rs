@@ -975,8 +975,13 @@ impl<'a> Emulator<'a> {
             });
             return v;
         }
-        // A backwards slice of the symbolic address may expose a small table
-        // index. Resolve every possible arm against immutable image bytes.
+        // Keep the established two-address path first so its expression shape and
+        // folding trajectory remain unchanged.
+        if let Some(v) = self.load_via_predicate_split(addr, width, site) {
+            return v;
+        }
+        // A backwards slice of the symbolic address may expose a wider, but still
+        // small, table index. Resolve every possible arm against immutable bytes.
         if let Some(v) = self.load_via_bounded_index(addr, width, site) {
             return v;
         }
@@ -995,7 +1000,52 @@ impl<'a> Emulator<'a> {
         v
     }
 
-    /// Resolve a load whose symbolic address is controlled by a small index.
+    /// Preserve the original two-address table-load recovery path.
+    fn load_via_predicate_split(&mut self, addr: Ref, width: Width, site: u64) -> Option<Ref> {
+        let candidates = boolean_subexpressions(&mut self.arena, addr);
+        for cand in candidates {
+            if self.pins.iter().any(|(p, _)| *p == cand) {
+                continue;
+            }
+            let mut alts = [None, None];
+            for (i, value) in [0u64, 1u64].into_iter().enumerate() {
+                let saved_pins = self.pins.len();
+                let saved_watermark = self.memo_pin_count;
+                self.pins.push((cand, value));
+                self.subst_memo.clear();
+                self.pin_dep.clear();
+                self.memo_pin_count = self.pins.len();
+                let folded = self.substitute(addr);
+                alts[i] = self.arena.as_const(folded);
+                self.pins.truncate(saved_pins);
+                self.subst_memo.clear();
+                self.pin_dep.clear();
+                self.memo_pin_count = saved_watermark;
+            }
+            let (Some(a0), Some(a1)) = (alts[0], alts[1]) else {
+                continue;
+            };
+            if a0 == a1 {
+                continue;
+            }
+            let (Some(v0), Some(v1)) = (self.image_load(a0, width), self.image_load(a1, width)) else {
+                continue;
+            };
+            let v = self.arena.select(cand, v1, v0);
+            let region = self.region_of_symbolic(addr);
+            self.events.push(Event::Load {
+                addr,
+                value: v,
+                width,
+                site,
+                region,
+            });
+            return Some(v);
+        }
+        None
+    }
+
+    /// Resolve a load whose symbolic address is controlled by a small multi-way index.
     ///
     /// The VM reads dispatch tables as `mov eax, [C + (cond << k)]`, where `cond`
     /// is a guest predicate the evaluator cannot decide. Pinning it both ways makes
@@ -1012,26 +1062,32 @@ impl<'a> Emulator<'a> {
     /// The range comes only from proven-zero high bits. Every value in that range
     /// must fold to a readable address; otherwise the load stays symbolic.
     fn load_via_bounded_index(&mut self, addr: Ref, width: Width, site: u64) -> Option<Ref> {
-        let candidates = bounded_subexpressions(&mut self.arena, addr);
+        // Probing rejected candidates interns folded expressions. Keep that work in
+        // a clone so a failed multi-way attempt cannot perturb the established
+        // two-way evaluator's structural hashes or node budget.
+        let mut probe = self.clone();
+        let candidates = bounded_subexpressions(&mut probe.arena, addr)
+            .into_iter()
+            .filter(|(_, span)| *span > 1);
         for (cand, span) in candidates {
-            if self.pins.iter().any(|(p, _)| *p == cand) {
+            if probe.pins.iter().any(|(p, _)| *p == cand) {
                 continue;
             }
             let mut addresses = Vec::with_capacity(span as usize + 1);
             let mut complete = true;
             for value in 0..=span {
-                let saved_pins = self.pins.len();
-                let saved_watermark = self.memo_pin_count;
-                self.pins.push((cand, value));
-                self.subst_memo.clear();
-                self.pin_dep.clear();
-                self.memo_pin_count = self.pins.len();
-                let folded = self.substitute(addr);
-                let concrete = self.arena.as_const(folded);
-                self.pins.truncate(saved_pins);
-                self.subst_memo.clear();
-                self.pin_dep.clear();
-                self.memo_pin_count = saved_watermark;
+                let saved_pins = probe.pins.len();
+                let saved_watermark = probe.memo_pin_count;
+                probe.pins.push((cand, value));
+                probe.subst_memo.clear();
+                probe.pin_dep.clear();
+                probe.memo_pin_count = probe.pins.len();
+                let folded = probe.substitute(addr);
+                let concrete = probe.arena.as_const(folded);
+                probe.pins.truncate(saved_pins);
+                probe.subst_memo.clear();
+                probe.pin_dep.clear();
+                probe.memo_pin_count = saved_watermark;
                 let Some(concrete) = concrete else {
                     complete = false;
                     break;
@@ -1041,17 +1097,19 @@ impl<'a> Emulator<'a> {
             if !complete || addresses.iter().all(|a| *a == addresses[0]) {
                 continue;
             }
-            let mut values = Vec::with_capacity(addresses.len());
-            for concrete in addresses {
-                let Some(value) = self.image_load(concrete, width) else {
-                    complete = false;
-                    break;
-                };
-                values.push(value);
-            }
-            if !complete {
+            if !addresses
+                .iter()
+                .all(|&concrete| probe.image_load(concrete, width).is_some())
+            {
                 continue;
             }
+            let values: Vec<Ref> = addresses
+                .into_iter()
+                .map(|concrete| {
+                    self.image_load(concrete, width)
+                        .expect("multi-way addresses were prevalidated")
+                })
+                .collect();
             let mut v = values[0];
             for (index, arm) in values.into_iter().enumerate().skip(1) {
                 let k = self.arena.constant(index as u64, self.arena.width(cand));
@@ -2714,13 +2772,36 @@ fn bounded_subexpressions(a: &mut Arena, r: Ref) -> Vec<(Ref, u64)> {
         .collect()
 }
 
-/// Boolean candidates retained for focused tests of two-way table addresses.
-#[cfg(test)]
+/// Subexpressions of `r` that provably hold only 0 or 1, deepest first.
 fn boolean_subexpressions(a: &mut Arena, r: Ref) -> Vec<Ref> {
-    bounded_subexpressions(a, r)
-        .into_iter()
-        .filter_map(|(node, span)| (span == 1).then_some(node))
-        .collect()
+    let mut out: Vec<(u32, Ref)> = Vec::new();
+    let mut stack = vec![(r, 0u32)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((cur, depth)) = stack.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        if !a.is_const(cur) && a.known_zero(cur) | 1 == u64::MAX {
+            out.push((depth, cur));
+        }
+        match *a.op(cur) {
+            Op::Bin(_, x, y) => {
+                stack.push((x, depth + 1));
+                stack.push((y, depth + 1));
+            }
+            Op::Un(_, x) | Op::Zext(x) | Op::Sext(x) | Op::Trunc(x) | Op::Load(x, _) => {
+                stack.push((x, depth + 1))
+            }
+            Op::Select(c, x, y) => {
+                stack.push((c, depth + 1));
+                stack.push((x, depth + 1));
+                stack.push((y, depth + 1));
+            }
+            _ => {}
+        }
+    }
+    out.sort_by_key(|(depth, _)| std::cmp::Reverse(*depth));
+    out.into_iter().map(|(_, node)| node).collect()
 }
 
 /// Whether the instruction has an FS/GS-relative memory operand. Only these two matter.
@@ -3464,7 +3545,13 @@ mod predicate_split_tests {
 
         let value = emu.load(addr, Width::W32, TABLE_BASE);
 
-        assert!(!matches!(emu.arena.op(value), Op::Load(..)));
+        let Op::Select(selector, _, _) = *emu.arena.op(value) else {
+            panic!("two-way table load was not rebuilt as a select")
+        };
+        assert_eq!(
+            selector, cond,
+            "the legacy two-way path must keep the predicate itself as selector"
+        );
         for (pin, expected) in words.into_iter().enumerate() {
             let mut probe = emu.clone();
             probe.pins.push((cond, pin as u64));
